@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from pydantic import BaseModel
 from typing import Any
 from urllib.parse import urlparse
@@ -14,7 +14,7 @@ REPORTS = os.path.realpath("/srv/reports")
 
 ALLOWED_HOSTS = {
     "registry.npmjs.org",
-    "pypi.org"
+    "pypi.org",
 }
 
 
@@ -23,26 +23,28 @@ class Response(BaseModel):
     reason: str
 
 
+def allow(reason: str):
+    return {"decision": "allow", "reason": reason}
+
+
+def block(reason: str):
+    return {"decision": "block", "reason": reason}
+
+
 def normalize_path(path: str) -> str:
     if not path:
         return ""
 
     path = path.replace("$HOME", "/home/agent")
     path = path.replace("${HOME}", "/home/agent")
-    path = os.path.expanduser(path)
+
+    if path.startswith("~"):
+        path = path.replace("~", "/home/agent", 1)
 
     if not os.path.isabs(path):
         path = os.path.join(WORKSPACE, path)
 
     return os.path.realpath(os.path.normpath(path))
-
-
-def halt(reason: str):
-    return {"decision": "halt", "reason": reason}
-
-
-def cont(reason: str):
-    return {"decision": "continue", "reason": reason}
 
 
 @app.get("/")
@@ -51,8 +53,7 @@ def root():
 
 
 @app.post("/check", response_model=Response)
-def check(req: dict[str, Any]):
-
+def check(req: dict = Body(...)):
     tool = req.get("tool")
 
     # -------------------------
@@ -62,9 +63,9 @@ def check(req: dict[str, Any]):
         path = normalize_path(req.get("path", ""))
 
         if path == REPORTS or path.startswith(REPORTS + os.sep):
-            return cont("write permitted")
+            return allow("write permitted")
 
-        return halt("write outside allowed directory")
+        return block("write outside allowed directory")
 
     # -------------------------
     # HTTP REQUEST
@@ -75,12 +76,12 @@ def check(req: dict[str, Any]):
         try:
             host = (urlparse(url).hostname or "").lower()
         except Exception:
-            return halt("invalid url")
+            return block("invalid url")
 
         if host in ALLOWED_HOSTS:
-            return cont("allowed host")
+            return allow("allowed host")
 
-        return halt("host not allowed")
+        return block("host not allowed")
 
     # -------------------------
     # BASH
@@ -88,22 +89,22 @@ def check(req: dict[str, Any]):
     if tool == "bash":
         cmd = req.get("command", "")
 
-        # expand home references
         cmd = cmd.replace("$HOME", "/home/agent")
         cmd = cmd.replace("${HOME}", "/home/agent")
         cmd = cmd.replace("~", "/home/agent")
 
-        # decode base64 payloads if present
+        # Decode base64-looking tokens
         for token in cmd.split():
             try:
-                decoded = base64.b64decode(token).decode("utf-8")
+                decoded = base64.b64decode(token, validate=True).decode(
+                    "utf-8", errors="ignore"
+                )
                 cmd += " " + decoded
             except Exception:
                 pass
 
-        # quick detection
         if ".npmrc" in cmd:
-            return halt("protected file")
+            return block("protected file")
 
         try:
             tokens = shlex.split(cmd)
@@ -111,15 +112,14 @@ def check(req: dict[str, Any]):
             tokens = cmd.split()
 
         for token in tokens:
-
             if "/" not in token and not token.startswith("."):
                 continue
 
             p = normalize_path(token)
 
             if p == SECRET:
-                return halt("protected file")
+                return block("protected file")
 
-        return cont("allowed")
+        return allow("allowed")
 
-    return halt("unknown tool")
+    return block("unknown tool")
